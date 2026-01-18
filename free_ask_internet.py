@@ -17,25 +17,37 @@ import tldextract
 import platform
 import urllib.parse
 
- 
+# Config
+LLM_HISTORY_LIMIT = int(os.environ.get("LLM_HISTORY_LIMIT", 5))
+
 def extract_url_content(url):
-    downloaded = trafilatura.fetch_url(url)
-    content =  trafilatura.extract(downloaded)
-    
-    return {"url":url, "content":content}
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        content =  trafilatura.extract(downloaded)
+        return {"url":url, "content":content}
+    except Exception as e:
+        print(f"Error extracting content from {url}: {e}")
+        return {"url":url, "content":""}
 
-
- 
 
 def search_web_ref(query:str, debug=False):
  
     content_list = []
 
     try:
-
+        # Using searxng service
         safe_string = urllib.parse.quote_plus(":all !general " + query)
 
-        response = requests.get('http://searxng:8080?q=' + safe_string + '&format=json')
+        # Check if running in docker or local to adjust URL if needed, 
+        # but sticking to original code's assumption of 'searxng' hostname 
+        # or localhost if mapped. The original code used http://searxng:8080.
+        # If running locally without docker network, this might fail unless mapped.
+        # Assuming environment is set up as per original code.
+        searx_url = os.environ.get("SEARXNG_URL", "http://searxng:8080")
+        if "localhost" in searx_url or "127.0.0.1" in searx_url:
+             pass # URL is likely fine
+        
+        response = requests.get(f'{searx_url}?q=' + safe_string + '&format=json')
         response.raise_for_status()
         search_results = response.json()
  
@@ -53,11 +65,16 @@ def search_web_ref(query:str, debug=False):
                 url = item.get('url')
                 pedding_urls.append(url)
 
+                icon_url = ""
+                site_name = ""
                 if url:
-                    url_parsed = urlparse(url)
-                    domain = url_parsed.netloc
-                    icon_url =  url_parsed.scheme + '://' + url_parsed.netloc + '/favicon.ico'
-                    site_name = tldextract.extract(url).domain
+                    try:
+                        url_parsed = urlparse(url)
+                        # domain = url_parsed.netloc
+                        icon_url =  url_parsed.scheme + '://' + url_parsed.netloc + '/favicon.ico'
+                        site_name = tldextract.extract(url).domain
+                    except:
+                        pass
  
                 conv_links.append({
                     'site_name':site_name,
@@ -78,7 +95,7 @@ def search_web_ref(query:str, debug=False):
                     res = future.result(timeout=5)
                     results.append(res)
             except concurrent.futures.TimeoutError:
-                print("任务执行超时")
+                print("Task timeout")
                 executor.shutdown(wait=False,cancel_futures=True)
 
             for content in results:
@@ -96,147 +113,167 @@ def search_web_ref(query:str, debug=False):
  
         return  conv_links,content_list
     except Exception as ex:
-        raise ex
+        print(f"Search error: {ex}")
+        return [], []
 
 
-def gen_prompt(question,content_list, lang="zh-CN", context_length_limit=11000,debug=False):
+def gen_prompt(question, content_list, history=None, lang="zh-CN", context_length_limit=11000, debug=False):
+    """
+    Generates the prompt messages including system instructions, history, and current context.
+    Returns a list of messages format: [{"role": "...", "content": "..."}]
+    """
+    if history is None:
+        history = []
     
-    limit_len = (context_length_limit - 2000)
-    if len(question) > limit_len:
-        question = question[0:limit_len]
-    
-    ref_content = [ item.get("content") for item in content_list]
-    
+    # 1. Determine language
     answer_language = ' Simplified Chinese '
     if lang == "zh-CN":
         answer_language = ' Simplified Chinese '
-    if lang == "zh-TW":
+    elif lang == "zh-TW":
         answer_language = ' Traditional Chinese '
-    if lang == "en-US":
+    elif lang == "en-US":
         answer_language = ' English '
 
-
-    if len(ref_content) > 0:
-        
-        if False:
-            prompts = '''
-            您是一位由 nash_su 开发的大型语言人工智能助手。您将被提供一个用户问题，并需要撰写一个清晰、简洁且准确的答案。提供了一组与问题相关的上下文，每个都以[[citation:x]]这样的编号开头，x代表一个数字。请在适当的情况下在句子末尾引用上下文。答案必须正确、精确，并以专家的中立和职业语气撰写。请将答案限制在2000个标记内。不要提供与问题无关的信息，也不要重复。如果给出的上下文信息不足，请在相关主题后写上“信息缺失：”。请按照引用编号[citation:x]的格式在答案中对应部分引用上下文。如果一句话源自多个上下文，请列出所有相关的引用编号，例如[citation:3][citation:5]，不要将引用集中在最后返回，而是在答案对应部分列出。除非是代码、特定的名称或引用编号，答案的语言应与问题相同。以下是上下文的内容集：
-            '''  + "\n\n" + "```" 
-            ref_index = 1
-
-            for ref_text in ref_content:
-                
-                prompts = prompts + "\n\n" + " [citation:{}]  ".format(str(ref_index)) +  ref_text
+    # 2. Build Context String
+    ref_text_list = []
+    if content_list:
+        ref_index = 1
+        for item in content_list:
+            content = item.get("content", "")
+            if content:
+                ref_text_list.append(f"[citation:{ref_index}] {content}")
                 ref_index += 1
+    
+    context_str = "\n\n".join(ref_text_list)
+    
+    # Truncate context if too long (rough estimation)
+    # Reserve tokens for history and system prompt
+    reserved_limit = 2000 
+    limit_len = max(0, context_length_limit - reserved_limit)
+    if len(context_str) > limit_len:
+        context_str = context_str[:limit_len] + "... (truncated)"
 
-            if len(prompts) >= limit_len:
-                prompts = prompts[0:limit_len]        
-            prompts = prompts + '''
-    ```
-    记住，不要一字不差的重复上下文内容. 回答必须使用简体中文，如果回答很长，请尽量结构化、分段落总结。请按照引用编号[citation:x]的格式在答案中对应部分引用上下文。如果一句话源自多个上下文，请列出所有相关的引用编号，例如[citation:3][citation:5]，不要将引用集中在最后返回，而是在答案对应部分列出。下面是用户问题：
-    ''' + question  
-        else:
-            prompts = '''
-            You are a large language AI assistant develop by nash_su. You are given a user question, and please write clean, concise and accurate answer to the question. You will be given a set of related contexts to the question, each starting with a reference number like [[citation:x]], where x is a number. Please use the context and cite the context at the end of each sentence if applicable.
-            Your answer must be correct, accurate and written by an expert using an unbiased and professional tone. Please limit to 1024 tokens. Do not give any information that is not related to the question, and do not repeat. Say "information is missing on" followed by the related topic, if the given context do not provide sufficient information.
+    # 3. System Prompt
+    system_prompt = f"""You are a helpful and knowledgeable AI assistant.
+Your goal is to answer the user's question accurately based on the provided reference context and conversation history.
+Please answer in {answer_language}.
 
-            Please cite the contexts with the reference numbers, in the format [citation:x]. If a sentence comes from multiple contexts, please list all applicable citations, like [citation:3][citation:5]. Other than code and specific names and citations, your answer must be written in the same language as the question.
-            Here are the set of contexts:
-            '''  + "\n\n" + "```" 
-            ref_index = 1
+Rules:
+1. Use the provided context to answer. If the context has relevant info, cite it using [citation:x] format at the end of sentences.
+2. If a sentence comes from multiple contexts, list all, e.g., [citation:3][citation:5].
+3. Do not blindly repeat the context. Summarize and explain.
+4. If the context is insufficient, rely on your general knowledge but mention that it's not from the provided context or that information is missing.
+5. Maintain a professional and neutral tone.
+"""
 
-            for ref_text in ref_content:
-                
-                prompts = prompts + "\n\n" + " [citation:{}]  ".format(str(ref_index)) +  ref_text
-                ref_index += 1
+    messages = [
+        {"role": "system", "content": system_prompt}
+    ]
 
-            if len(prompts) >= limit_len:
-                prompts = prompts[0:limit_len]        
-            prompts = prompts + '''
-            ```
-            Above is the reference contexts. Remember, don't repeat the context word for word. Answer in ''' + answer_language + '''. If the response is lengthy, structure it in paragraphs and summarize where possible. Cite the context using the format [citation:x] where x is the reference number. If a sentence originates from multiple contexts, list all relevant citation numbers, like [citation:3][citation:5]. Don't cluster the citations at the end but include them in the answer where they correspond.
-            Remember, don't blindly repeat the contexts verbatim. And here is the user question:
-            ''' + question  
- 
-     
+    # 4. Inject History
+    # Filter valid messages and limit history
+    valid_history = [h for h in history if h.get("role") in ["user", "assistant"]]
+    if LLM_HISTORY_LIMIT > 0:
+        valid_history = valid_history[-LLM_HISTORY_LIMIT:]
+    
+    messages.extend(valid_history)
+
+    # 5. Construct Current User Message with Context
+    user_content = f"Question: {question}\n\n"
+    
+    if context_str:
+        user_content += f"Reference Context:\n```\n{context_str}\n```\n\n"
+        user_content += "Please answer the question using the context above and our history."
     else:
-        prompts = question
+        user_content += "Please answer the question based on our history and your knowledge."
+
+    messages.append({"role": "user", "content": user_content})
 
     if debug:
-        print(prompts)
-        print("总长度："+ str(len(prompts)))
-    return prompts
+        print("Generated Messages:")
+        for m in messages:
+            print(f"Role: {m['role']}, Length: {len(m['content'])}")
+
+    return messages
 
 
-def chat(prompt, model:str,llm_auth_token:str,llm_base_url:str,using_custom_llm=False,stream=True, debug=False):
-    openai.base_url = "http://127.0.0.1:3040/v1/"
+def chat(messages, model:str, llm_auth_token:str, llm_base_url:str, using_custom_llm=False, stream=True, debug=False):
+    # Setup OpenAI Client
+    # Defaults
+    api_key = llm_auth_token if llm_auth_token else "CUSTOM"
+    base_url = llm_base_url
 
-    if model == "gpt3.5":
-        openai.base_url = "http://llm-freegpt35:3040/v1/"
+    # Predefined models mapping (simulated from original code)
+    if not using_custom_llm:
+        openai.base_url = "http://127.0.0.1:3040/v1/" # Default
+        if model == "gpt3.5":
+            base_url = "http://llm-freegpt35:3040/v1/"
+        elif model == "kimi":
+            base_url = "http://llm-kimi:8000/v1/"
+        elif model == "glm4":
+            base_url = "http://llm-glm4:8000/v1/"
+        elif model == "qwen":
+            base_url = "http://llm-qwen:8000/v1/"
     
-    if model == "kimi":
-        openai.base_url = "http://llm-kimi:8000/v1/"
-    if model == "glm4":
-        openai.base_url = "http://llm-glm4:8000/v1/"
-    if model == "qwen":
-        openai.base_url = "http://llm-qwen:8000/v1/"
+    if using_custom_llm and llm_base_url:
+        base_url = llm_base_url
     
-
-    if llm_auth_token == '':
-        llm_auth_token = "CUSTOM"
-        
-    openai.api_key = llm_auth_token
-
-    if using_custom_llm:
-        openai.base_url = llm_base_url
-        openai.api_key = llm_auth_token
-
-
-    total_content = ""
-    for chunk in openai.chat.completions.create(
-        model=model,
-        messages=[{
-            "role": "user",
-            "content": prompt
-        }],
-        stream=True,
-        max_tokens=1024,temperature=0.2
-    ):
-        stream_resp = chunk.dict()
-        token = stream_resp["choices"][0]["delta"].get("content", "")
-        if token:
-            
-            total_content += token
-            yield token
-    if debug:
-        print(total_content)
- 
-
- 
+    # Configure global openai (or use client instance if upgrading, but sticking to global for compatibility with older patterns if mixed)
+    # However, newer openai versions use client. 
+    # The requirement.txt has openai==1.16.2 which uses Client.
     
-def ask_internet(query:str,  debug=False):
-  
-    content_list = search_web_ref(query,debug=debug)
-    if debug:
-        print(content_list)
-    prompt = gen_prompt(query,content_list,context_length_limit=6000,debug=debug)
-    total_token =  ""
- 
-    for token in chat(prompt=prompt):
-    # for token in daxianggpt.chat(prompt=prompt):
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=stream,
+            max_tokens=1024,
+            temperature=0.2
+        )
+
+        if stream:
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        else:
+            if response.choices:
+                yield response.choices[0].message.content
+            else:
+                yield ""
+
+    except Exception as e:
+        print(f"Chat Error: {e}")
+        yield f"[Error: {str(e)}]"
+
+    
+def ask_internet(query:str,  history=None, model="gpt3.5", llm_auth_token="", llm_base_url="", using_custom_llm=False, debug=False, search_enabled=True):
+    
+    content_list = []
+    search_links = []
+    
+    if search_enabled:
+        if debug:
+            print(f"Searching for: {query}")
+        search_links, content_list = search_web_ref(query, debug=debug)
+    
+    # Generate messages
+    messages = gen_prompt(query, content_list, history=history, debug=debug)
+    
+    # Stream answer
+    total_token = ""
+    for token in chat(messages, model, llm_auth_token, llm_base_url, using_custom_llm, stream=True, debug=debug):
         if token:
             total_token += token
             yield token
-    yield "\n\n"
-    # 是否返回参考资料
-    if True:
-        yield "---"
-        yield "\n"
-        yield "参考资料:\n"
+            
+    # Yield references if search was performed and we have results
+    if search_enabled and search_links:
+        yield "\n\n---\n**References:**\n"
         count = 1
-        for url_content in content_list:
-            url = url_content.get('url')
-            yield "*[{}. {}]({})*".format(str(count),url,url )  
-            yield "\n"
+        for item in search_links:
+            url = item.get('url')
+            title = item.get('title')
+            yield f"{count}. [{title}]({url})\n"
             count += 1
- 

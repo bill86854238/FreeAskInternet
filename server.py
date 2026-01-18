@@ -203,12 +203,16 @@ async def get_search_refs(request: QueryRequest):
    
     return  resp
 
-def generator(prompt:str, model:str, llm_auth_token:str,llm_base_url:str, using_custom_llm=False,is_failed=False):
+def generator(messages: Union[str, List[dict]], model:str, llm_auth_token:str, llm_base_url:str, using_custom_llm=False, is_failed=False):
     if is_failed:
         yield "搜索失败，没有返回结果"
     else:
+        # Compatibility: if string, wrap it
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+            
         total_token = ""
-        for token in  free_ask_internet.chat(prompt=prompt,model=model,llm_auth_token=llm_auth_token,llm_base_url=llm_base_url,using_custom_llm=using_custom_llm,stream=True):
+        for token in free_ask_internet.chat(messages=messages, model=model, llm_auth_token=llm_auth_token, llm_base_url=llm_base_url, using_custom_llm=using_custom_llm, stream=True):
             total_token += token
             yield token
  
@@ -225,16 +229,21 @@ async def stream(search_uuid:str,request: QueryRequest):
             answer_language = ' Traditional Chinese '
         if request.lang == "en-US":
             answer_language = ' English '
-        prompt = ' You are a large language AI assistant develop by nash_su. Answer user question in ' + answer_language + '. And here is the user question: ' + request.query
-        generate = generator(prompt,model=request.model,llm_auth_token=request.llm_auth_token, llm_base_url=request.llm_base_url, using_custom_llm=request.using_custom_llm)
+        
+        # Construct message list for LLM only
+        messages = [
+            {"role": "system", "content": f"You are a large language AI assistant develop by nash_su. Answer user question in {answer_language}."},
+            {"role": "user", "content": request.query}
+        ]
+        generate = generator(messages,model=request.model,llm_auth_token=request.llm_auth_token, llm_base_url=request.llm_base_url, using_custom_llm=request.using_custom_llm)
     else:
-        prompt = None
+        messages = None
         limit_count = 10
 
         while limit_count > 0:
             try:
                 if len(search_results) > 0:
-                    prompt = free_ask_internet.gen_prompt(request.query,search_results,lang=request.lang,context_length_limit=8000)
+                    messages = free_ask_internet.gen_prompt(request.query, search_results, lang=request.lang, context_length_limit=8000)
                     break
                 else:
                     limit_count -= 1
@@ -242,11 +251,11 @@ async def stream(search_uuid:str,request: QueryRequest):
             except Exception as err:
                 limit_count -= 1
                 time.sleep(1)
-        total_token =  ""
-        if prompt:   
-            generate = generator(prompt,model=request.model,llm_auth_token=request.llm_auth_token, llm_base_url=request.llm_base_url, using_custom_llm=request.using_custom_llm)
+        
+        if messages:   
+            generate = generator(messages,model=request.model,llm_auth_token=request.llm_auth_token, llm_base_url=request.llm_base_url, using_custom_llm=request.using_custom_llm)
         else:
-            generate = generator(prompt,model=request.model,llm_auth_token=request.llm_auth_token,llm_base_url=request.llm_base_url, using_custom_llm=request.using_custom_llm,is_failed=True)
+            generate = generator(messages if messages else [], model=request.model,llm_auth_token=request.llm_auth_token,llm_base_url=request.llm_base_url, using_custom_llm=request.using_custom_llm,is_failed=True)
 
     # return EventSourceResponse(generate, media_type="text/event-stream")
     return StreamingResponse(generate, media_type="text/event-stream")
